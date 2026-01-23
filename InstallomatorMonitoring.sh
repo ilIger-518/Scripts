@@ -27,7 +27,9 @@ fi
 
 # Logging function for this script. to use it, just call 'log "your message"' in your script
 logd() {
-    echo "$(date "+%Y-%m-%d %H:%M:%S")" "[${scriptName}]: ${*}" >> "${logFile}"
+    local message="$(date "+%Y-%m-%d %H:%M:%S") [${scriptName}]: ${*}"
+    echo "${message}" >> "${logFile}"
+    echo "${message}"
 }
 
 logd "$(printf "%0.s# " {1..10}) "Starting ${scriptName} script  "$(printf "%0.s# " {1..10})"
