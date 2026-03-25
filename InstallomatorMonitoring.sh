@@ -22,17 +22,26 @@ logFile="${logDir}/$(echo "${scriptName}" | cut -d . -f1).log"
 # Creating Log file directory
 if [[ ! -d "${logDir}" ]]
 then
-    mkdir -p "${logDir}"
+    if ! mkdir -p "${logDir}"; then
+        echo "ERROR: Unable to create log directory at ${logDir}"
+        exit 1
+    fi
+fi
+
+if ! touch "${logFile}" 2>/dev/null; then
+    echo "ERROR: Unable to write log file at ${logFile}"
+    exit 1
 fi
 
 # Logging function for this script. to use it, just call 'log "your message"' in your script
 logd() {
-    local message="$(date "+%Y-%m-%d %H:%M:%S") [${scriptName}]: ${*}"
+    local message
+    message="$(date "+%Y-%m-%d %H:%M:%S") [${scriptName}]: $*"
     echo "${message}" >> "${logFile}"
     echo "${message}"
 }
 
-logd "$(printf "%0.s# " {1..10}) "Starting ${scriptName} script  "$(printf "%0.s# " {1..10})"
+logd "$(printf "%0.s# " {1..10}) Starting ${scriptName} script $(printf "%0.s# " {1..10})"
 # Code for this script goes here below this line
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
@@ -43,6 +52,20 @@ labelsFile="${scriptDir}/Installomator/Labels.txt"
 monitoringStartTime=$(date "+%Y-%m-%d_%H-%M-%S")
 failureLogFile="${logDir}/InstallomatorMonitoringLog_${monitoringStartTime}.log"
 failureLogCreated=false
+failureCount=0
+processedCount=0
+
+normalizeLabel() {
+    local rawLabel="$1"
+    local normalizedLabel="${rawLabel#"${rawLabel%%[![:space:]]*}"}"
+    normalizedLabel="${normalizedLabel%"${normalizedLabel##*[![:space:]]}"}"
+
+    if [[ -z "${normalizedLabel}" ]] || [[ "${normalizedLabel}" == \#* ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${normalizedLabel}"
+}
 
 # Check if Installomator script exists
 if [[ ! -f "${installomatorScript}" ]]; then
@@ -56,60 +79,87 @@ if [[ ! -f "${labelsFile}" ]]; then
     exit 1
 fi
 
-# Count total lines in Labels file
-totalLabels=$(wc -l < "${labelsFile}" | tr -d ' ')
-logd "Found ${totalLabels} labels in ${labelsFile}"
+# Count actionable labels in Labels file
+totalLabels=0
+while IFS= read -r label || [[ -n "${label}" ]]; do
+    if normalizeLabel "${label}" >/dev/null; then
+        ((totalLabels++))
+    fi
+done < "${labelsFile}"
 
-# Start code here for the application part of this script
-lineNumber=0
+logd "Found ${totalLabels} actionable labels in ${labelsFile}"
+
+if [[ ${totalLabels} -eq 0 ]]; then
+    logd "No actionable labels found in ${labelsFile}"
+    logd "$(printf "%0.s# " {1..10}) Finished ${scriptName} script $(printf "%0.s# " {1..10})"
+    exit 0
+fi
 
 # Read each line from Labels.txt and execute Installomator.sh
 while IFS= read -r label || [[ -n "${label}" ]]; do
-    # Skip empty lines
-    if [[ -z "${label}" ]]; then
+    normalizedLabel=$(normalizeLabel "${label}") || {
         continue
-    fi
+    }
     
-    ((lineNumber++))
-    logd "Processing label ${lineNumber}/${totalLabels}: ${label}"
+    ((processedCount++))
+    logd "Processing label ${processedCount}/${totalLabels}: ${normalizedLabel}"
     
     # Execute Installomator with the label and capture output
-    installomatorOutput=$("${installomatorScript}" "${label}" 2>&1)
+    installomatorOutput=$("${installomatorScript}" "${normalizedLabel}" 2>&1)
     installomatorExitCode=$?
-    
-    # Check the last line for exit code status
-    lastLine=$(echo "${installomatorOutput}" | tail -n 1)
-    
-    # Check if exit code is 0
-    if [[ "${lastLine}" == *"exit code 0"* ]] && [[ ${installomatorExitCode} -eq 0 ]]; then
-        logd "SUCCESS: Installomator completed for label: ${label}"
+
+    if [[ ${installomatorExitCode} -eq 0 ]]; then
+        logd "SUCCESS: Installomator completed for label: ${normalizedLabel}"
     else
-        logd "ERROR: Installomator failed for label: ${label}"
-        logd "Last output line: ${lastLine}"
+        ((failureCount++))
+        lastLine=$(printf '%s\n' "${installomatorOutput}" | tail -n 1)
+        logd "ERROR: Installomator failed for label: ${normalizedLabel}"
         logd "Exit code: ${installomatorExitCode}"
+        if [[ -n "${lastLine}" ]]; then
+            logd "Last output line: ${lastLine}"
+        fi
         
         # Create/initialize failure log file if not exists
         if [[ "${failureLogCreated}" == false ]]; then
-            echo "Installomator Monitoring Failure Log - Started: $(date "+%Y-%m-%d %H:%M:%S")" > "${failureLogFile}"
+            {
+                echo "Installomator Monitoring Failure Log - Started: $(date "+%Y-%m-%d %H:%M:%S")"
+                echo
+            } > "${failureLogFile}"
             failureLogCreated=true
             logd "Created failure log file: ${failureLogFile}"
         fi
         
-        # Append failed label to failure log
-        echo "$(date "+%Y-%m-%d %H:%M:%S") - FAILED: ${label} (Exit code: ${installomatorExitCode})" >> "${failureLogFile}"
+        # Persist full Installomator output for troubleshooting.
+        {
+            echo "-----"
+            echo "Timestamp: $(date "+%Y-%m-%d %H:%M:%S")"
+            echo "Label: ${normalizedLabel}"
+            echo "Exit code: ${installomatorExitCode}"
+            echo "Output:"
+            if [[ -n "${installomatorOutput}" ]]; then
+                printf '%s\n' "${installomatorOutput}"
+            else
+                echo "[no output captured]"
+            fi
+            echo
+        } >> "${failureLogFile}"
     fi
     
 done < "${labelsFile}"
 
-logd "Processed all ${lineNumber} labels from ${labelsFile}"
+logd "Processed all ${processedCount} actionable labels from ${labelsFile}"
 
 # Summary
 if [[ "${failureLogCreated}" == true ]]; then
-    logd "Failures detected. See detailed log at: ${failureLogFile}"
+    logd "Failures detected (${failureCount}/${processedCount}). See detailed log at: ${failureLogFile}"
 else
     logd "All labels processed successfully with no failures detected"
 fi
 
 # End of code for this script
-logd "$(printf "%0.s# " {1..10}) "Finished ${scriptName} script  "$(printf "%0.s# " {1..10})"
+logd "$(printf "%0.s# " {1..10}) Finished ${scriptName} script $(printf "%0.s# " {1..10})"
+if [[ ${failureCount} -gt 0 ]]; then
+    exit 1
+fi
+
 exit 0
