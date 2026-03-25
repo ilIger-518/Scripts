@@ -55,6 +55,19 @@ failureLogCreated=false
 failureCount=0
 processedCount=0
 
+# Jira configuration
+# If new issues already land in "Zu erledigen", leave jiraStatusTransitionId empty.
+jiraEnabled="false"
+jiraBaseUrl="https://yourcompany.atlassian.net"
+jiraProjectKey="IMON"
+jiraIssueType="Task"
+jiraUserEmail="service-account@yourcompany.com"
+jiraApiToken="replace-with-your-api-token"
+jiraStatusTransitionId=""
+jiraSummaryPrefix="Installomator label failed"
+
+jiraConfigured=false
+
 normalizeLabel() {
     local rawLabel="$1"
     local normalizedLabel="${rawLabel#"${rawLabel%%[![:space:]]*}"}"
@@ -67,6 +80,140 @@ normalizeLabel() {
     printf '%s\n' "${normalizedLabel}"
 }
 
+isJiraConfigured() {
+    [[ "${jiraEnabled:l}" == "true" ]] \
+        && [[ -n "${jiraBaseUrl}" ]] \
+        && [[ -n "${jiraProjectKey}" ]] \
+        && [[ -n "${jiraUserEmail}" ]] \
+        && [[ -n "${jiraApiToken}" ]]
+}
+
+transitionJiraIssue() {
+    local issueKey="$1"
+    local responseBody httpCode
+
+    if [[ -z "${jiraStatusTransitionId}" ]]; then
+        return 0
+    fi
+
+    responseBody=$(mktemp)
+    httpCode=$(
+        curl --silent --show-error --location \
+            --request POST \
+            --url "${jiraBaseUrl}/rest/api/3/issue/${issueKey}/transitions" \
+            --user "${jiraUserEmail}:${jiraApiToken}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data "$(jq -cn --arg transitionId "${jiraStatusTransitionId}" '{transition: {id: $transitionId}}')" \
+            --output "${responseBody}" \
+            --write-out "%{http_code}"
+    )
+
+    if [[ "${httpCode}" != "204" ]]; then
+        logd "ERROR: Jira transition failed for ${issueKey}. HTTP ${httpCode}: $(cat "${responseBody}")"
+        rm -f "${responseBody}"
+        return 1
+    fi
+
+    rm -f "${responseBody}"
+    return 0
+}
+
+createJiraIssue() {
+    local failedLabel="$1"
+    local exitCode="$2"
+    local installomatorLog="$3"
+    local summary description payload responseBody httpCode issueKey
+
+    if ! ${jiraConfigured}; then
+        logd "Jira issue creation skipped because Jira is not configured"
+        return 1
+    fi
+
+    summary="${jiraSummaryPrefix}: ${failedLabel}"
+    description=$(cat <<EOF
+Installomator monitoring detected a failed label.
+
+Label: ${failedLabel}
+Exit code: ${exitCode}
+Host: $(scutil --get ComputerName 2>/dev/null || hostname)
+Script: ${scriptName}
+Timestamp: $(date "+%Y-%m-%d %H:%M:%S")
+
+Installomator output:
+${installomatorLog:-[no output captured]}
+EOF
+)
+
+    payload=$(
+        jq -cn \
+            --arg projectKey "${jiraProjectKey}" \
+            --arg issueType "${jiraIssueType}" \
+            --arg summary "${summary}" \
+            --arg description "${description}" \
+            '{
+                fields: {
+                    project: { key: $projectKey },
+                    issuetype: { name: $issueType },
+                    summary: $summary,
+                    description: {
+                        type: "doc",
+                        version: 1,
+                        content: [
+                            {
+                                type: "paragraph",
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: $description
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }'
+    )
+
+    responseBody=$(mktemp)
+    httpCode=$(
+        curl --silent --show-error --location \
+            --request POST \
+            --url "${jiraBaseUrl}/rest/api/3/issue" \
+            --user "${jiraUserEmail}:${jiraApiToken}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data "${payload}" \
+            --output "${responseBody}" \
+            --write-out "%{http_code}"
+    )
+
+    if [[ "${httpCode}" != "201" ]]; then
+        logd "ERROR: Jira issue creation failed for label ${failedLabel}. HTTP ${httpCode}: $(cat "${responseBody}")"
+        rm -f "${responseBody}"
+        return 1
+    fi
+
+    issueKey=$(jq -r '.key // empty' "${responseBody}")
+    rm -f "${responseBody}"
+
+    if [[ -z "${issueKey}" ]]; then
+        logd "ERROR: Jira issue creation returned no issue key for label ${failedLabel}"
+        return 1
+    fi
+
+    logd "Created Jira issue ${issueKey} for failed label ${failedLabel}"
+
+    if [[ -n "${jiraStatusTransitionId}" ]]; then
+        transitionJiraIssue "${issueKey}" || return 1
+        logd "Moved Jira issue ${issueKey} using transition ID ${jiraStatusTransitionId}"
+    else
+        logd "Jira issue ${issueKey} will use the project's default initial status. Set JIRA_STATUS_TRANSITION_ID if it must be moved explicitly to 'Zu erledigen'"
+    fi
+
+    return 0
+}
+
 # Check if Installomator script exists
 if [[ ! -f "${installomatorScript}" ]]; then
     logd "ERROR: Installomator script not found at ${installomatorScript}"
@@ -77,6 +224,13 @@ fi
 if [[ ! -f "${labelsFile}" ]]; then
     logd "ERROR: Labels file not found at ${labelsFile}"
     exit 1
+fi
+
+if isJiraConfigured; then
+    jiraConfigured=true
+    logd "Jira integration enabled for project ${jiraProjectKey}"
+elif [[ "${jiraEnabled:l}" == "true" ]]; then
+    logd "ERROR: Jira integration was enabled but configuration is incomplete"
 fi
 
 # Count actionable labels in Labels file
@@ -143,6 +297,8 @@ while IFS= read -r label || [[ -n "${label}" ]]; do
             fi
             echo
         } >> "${failureLogFile}"
+
+        createJiraIssue "${normalizedLabel}" "${installomatorExitCode}" "${installomatorOutput}"
     fi
     
 done < "${labelsFile}"
