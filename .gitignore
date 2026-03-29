@@ -1,0 +1,15 @@
+# Environment variables (contains sensitive passwords)
+.env
+
+# WordPress content directory (can be large)
+wp-content/uploads/
+wp-content/cache/
+wp-content/upgrade/
+
+# Backup files
+*.sql
+*.tar.gz
+*.zip
+
+# Docker volumes
+volumes/
